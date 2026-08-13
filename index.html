@@ -91,6 +91,13 @@
   .score-box .value{ font-size:24px; font-weight:700; color:var(--gold); }
   .score-box .value.small{ font-size:15px; color:var(--text); }
 
+  .export-btn{
+    width:100%; margin-top:10px; padding:11px 14px; border-radius:12px;
+    border:1px solid var(--gold-dim); background:rgba(220,183,82,0.08); color:var(--gold);
+    font-size:13px; font-weight:600; font-family:inherit; cursor:pointer;
+  }
+  .export-btn:active{ transform:scale(0.98); }
+
   /* ---------- search ---------- */
   .search-wrap{ padding:2px 16px 10px; }
   .search{
@@ -274,6 +281,8 @@
       <div class="value small" id="topPlayer">—</div>
     </div>
   </div>
+
+  <button class="export-btn" id="exportBtn">📋 Export month for group chat</button>
 </header>
 
 <div class="search-wrap">
@@ -292,7 +301,7 @@
 
 <div class="squad-panel" id="finesPanel">
   <div class="fine-add-row">
-    <input class="squad-input" id="newFineLabel" placeholder="Fine name (e.g. Late for bus)" />
+    <input class="squad-input" id="newFineLabel" placeholder="Fine name" />
     <input class="fine-price-input" id="newFinePrice" type="number" step="0.5" min="0" placeholder="£" />
     <input class="squad-input fine-unit-input" id="newFineUnit" placeholder="Unit (optional, e.g. per item)" />
     <button class="squad-add-btn" id="addFineBtn">Add</button>
@@ -369,8 +378,13 @@
 
   // Custom fine types added from within the app, stored in Firestore so
   // everyone on the team sees the same list. Merged with DEFAULT_FINES above.
+  // hiddenDefaultIds lets built-in fines be "removed" from the app without
+  // touching the code — past tallies logged under them stay on record.
   let customFines = [];
-  function FINES_LIST(){ return DEFAULT_FINES.concat(customFines); }
+  let hiddenDefaultIds = [];
+  function FINES_LIST(){
+    return DEFAULT_FINES.filter(f => !hiddenDefaultIds.includes(f.id)).concat(customFines);
+  }
 
   const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 
@@ -473,7 +487,9 @@
   function subscribeCustomFines(){
     unsubscribeCustomFines = customFinesDocRef().onSnapshot(
       snap => {
-        customFines = (snap.exists && Array.isArray(snap.data().fines)) ? snap.data().fines.slice() : [];
+        const d = snap.exists ? snap.data() : {};
+        customFines = Array.isArray(d.fines) ? d.fines.slice() : [];
+        hiddenDefaultIds = Array.isArray(d.hidden) ? d.hidden.slice() : [];
         render();
         renderFinesPanel();
       },
@@ -481,9 +497,8 @@
     );
   }
 
-  function saveCustomFines(next){
-    customFines = next.slice();
-    customFinesDocRef().set({ fines: customFines }).catch(()=>{
+  function saveFinesDoc(){
+    customFinesDocRef().set({ fines: customFines, hidden: hiddenDefaultIds }).catch(()=>{
       showToast("Couldn't save fine — check connection");
     });
   }
@@ -508,15 +523,21 @@
       return;
     }
     const fine = { id: slugify(label), label: unit ? `${label} (${unit})` : label, price };
-    saveCustomFines([...customFines, fine]);
+    customFines = [...customFines, fine];
+    saveFinesDoc();
     showToast(label + " added to fine list");
   }
 
-  function removeCustomFine(id){
-    const fine = customFines.find(f => f.id === id);
+  function removeFine(id){
+    const fine = FINES_LIST().find(f => f.id === id);
     if(!fine) return;
     if(!confirm(`Remove "${fine.label}" from the fine list? Past tallies logged under it stay on record but the chip disappears.`)) return;
-    saveCustomFines(customFines.filter(f => f.id !== id));
+    if(customFines.some(f => f.id === id)){
+      customFines = customFines.filter(f => f.id !== id);
+    } else {
+      hiddenDefaultIds = [...hiddenDefaultIds, id];
+    }
+    saveFinesDoc();
     showToast(fine.label + " removed");
   }
 
@@ -750,10 +771,11 @@
   function renderFinesPanel(){
     const list = document.getElementById("fineManageList");
     if(!list) return;
-    if(customFines.length === 0){
-      list.innerHTML = `<div class="squad-empty">No custom fines yet — add one above. Built-in fines can't be removed here.</div>`;
+    const all = FINES_LIST();
+    if(all.length === 0){
+      list.innerHTML = `<div class="squad-empty">No fines yet — add one above.</div>`;
     } else {
-      list.innerHTML = customFines.map(f => `
+      list.innerHTML = all.map(f => `
         <div class="fine-manage-chip">
           <span class="fmc-info">${f.label}<span class="fmc-price">£${f.price}</span></span>
           <span class="remove" data-remove-fine="${f.id}">✕</span>
@@ -762,9 +784,38 @@
     }
     list.querySelectorAll("[data-remove-fine]").forEach(el=>{
       el.addEventListener("click", ()=>{
-        removeCustomFine(el.getAttribute("data-remove-fine"));
+        removeFine(el.getAttribute("data-remove-fine"));
       });
     });
+  }
+
+  function buildExportText(){
+    const names = getDisplayedPlayers()
+      .map(n => ({ name: n, total: playerTotal(data[n]) }))
+      .filter(p => p.total > 0)
+      .sort((a,b) => b.total - a.total);
+
+    const heading = MONTH_NAMES[currentDate.getMonth()] + " " + currentDate.getFullYear() + " — Fines";
+    const lines = [heading, ""];
+    if(names.length === 0){
+      lines.push("No fines logged this month. 🎉");
+    } else {
+      names.forEach(p => lines.push(p.name + " — " + money(p.total)));
+      lines.push("");
+      lines.push("Total due: " + money(grandTotal()));
+    }
+    return lines.join("\n");
+  }
+
+  async function exportMonth(){
+    const text = buildExportText();
+    try{
+      await navigator.clipboard.writeText(text);
+      showToast("Copied — paste it into the group chat");
+    }catch(e){
+      // Clipboard API blocked (e.g. non-HTTPS, permissions) — fall back to a manual copy prompt
+      window.prompt("Couldn't copy automatically — select all and copy:", text);
+    }
   }
 
   function renderRules(){
@@ -782,6 +833,7 @@
 
   document.getElementById("prevMonth").addEventListener("click", ()=>changeMonth(-1));
   document.getElementById("nextMonth").addEventListener("click", ()=>changeMonth(1));
+  document.getElementById("exportBtn").addEventListener("click", exportMonth);
   document.getElementById("search").addEventListener("input", renderPlayerList);
   document.getElementById("rulesToggle").addEventListener("click", ()=>{
     document.getElementById("rulesPanel").classList.toggle("show");
@@ -791,6 +843,7 @@
   });
   document.getElementById("finesToggle").addEventListener("click", ()=>{
     document.getElementById("finesPanel").classList.toggle("show");
+    renderFinesPanel();
   });
   document.getElementById("addFineBtn").addEventListener("click", ()=>{
     const labelInput = document.getElementById("newFineLabel");
@@ -823,6 +876,7 @@
 
   renderRules();
   render();
+  renderFinesPanel();
   subscribeMonth();
   subscribeRoster();
   subscribeCustomFines();
